@@ -1,0 +1,276 @@
+{
+  "name": "Softr Jobs → AI Report → PDF Email",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "minutes", "minutesInterval": 15 }]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "⏱ Poll Every 15 Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.airtable.com/v0/{{$vars.AIRTABLE_BASE_ID}}/Jobs",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [{ "name": "Authorization", "value": "Bearer {{$vars.AIRTABLE_API_KEY}}" }]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "filterByFormula", "value": "AND({Status}='Submitted', {Notes}!='')" },
+            { "name": "maxRecords", "value": "10" }
+          ]
+        }
+      },
+      "id": "fetch-jobs",
+      "name": "📋 Fetch Jobs (Airtable / Softr)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [480, 300],
+      "notes": "Reads Airtable — the database Softr sits on top of. Pulls Submitted jobs that have Notes and haven't been processed."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# ── STEP 1: STRUCTURING (NO AI) ──────────────────────────────────────────────\n# Maps raw Airtable fields to a clean internal schema.\n#\n# Real Jobs table columns:\n#   Job Title, Job Number, Status, Scheduled Date, Priority,\n#   Customer Name, Service Address, Description, Notes,\n#   Submitted At, Completed At, Assigned Technician, Job Updates, Customer email\n\nimport json\nfrom datetime import datetime\n\nrecords = _input.first().json.get('records', [])\noutput = []\n\nfor record in records:\n    f = record.get('fields', {})\n\n    # Job Updates: semicolon-delimited string -> list\n    raw_updates = f.get('Job Updates', '')\n    if isinstance(raw_updates, list):\n        job_updates = [u.strip() for u in raw_updates if u.strip()]\n    elif isinstance(raw_updates, str) and raw_updates:\n        job_updates = [u.strip() for u in raw_updates.split(';') if u.strip()]\n    else:\n        job_updates = []\n\n    # Timestamps -> ISO strings + duration in minutes\n    def parse_dt(val):\n        if not val:\n            return None\n        try:\n            return datetime.fromisoformat(val.replace('Z', '+00:00'))\n        except (ValueError, AttributeError):\n            return None\n\n    submitted_dt = parse_dt(f.get('Submitted At'))\n    completed_dt = parse_dt(f.get('Completed At'))\n\n    duration_mins = None\n    if submitted_dt and completed_dt:\n        delta = completed_dt - submitted_dt\n        duration_mins = round(delta.total_seconds() / 60)\n\n    job = {\n        'record_id':           record.get('id', ''),\n        'job_number':          f.get('Job Number', record.get('id', '')),\n        'job_title':           f.get('Job Title', 'General Service'),\n        'status':              f.get('Status', 'Submitted'),\n        'priority':            f.get('Priority', 'Normal'),\n        'scheduled_date':      f.get('Scheduled Date', ''),\n        'customer_name':       f.get('Customer Name', 'Unknown Customer'),\n        'customer_email':      f.get('Customer email', ''),\n        'service_address':     f.get('Service Address', ''),\n        'description':         f.get('Description', ''),\n        'technician_notes':    f.get('Notes', ''),\n        'assigned_technician': f.get('Assigned Technician', 'Unknown'),\n        'job_updates':         job_updates,\n        'submitted_at':        submitted_dt.isoformat() if submitted_dt else None,\n        'completed_at':        completed_dt.isoformat() if completed_dt else None,\n        'duration_mins':       duration_mins,\n    }\n\n    output.append({'json': job})\n\nreturn output\n"
+      },
+      "id": "structure-data",
+      "name": "🗂 STEP 1: Structure & Map Fields",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300],
+      "notes": "NO AI — pure Python. Maps every Airtable column to a normalised internal schema. Job Updates split on semicolons."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# ── STEP 2: LIGHT AI — Claude Haiku ─────────────────────────────────────────\n# Cleans messy technician notes, extracts structured issues, converts to JSON.\n# Uses the cheapest model — runs for every job.\n#\n# Inputs consumed: description, technician_notes (Notes column), job_updates\n\nimport json\nimport urllib.request\n\njob = _input.first().json\n\n# Build the raw text block for the AI\nparts = []\nif job.get('description'):\n    parts.append(f\"CUSTOMER-REPORTED ISSUE:\\n{job['description']}\")\nif job.get('technician_notes'):\n    parts.append(f\"TECHNICIAN NOTES:\\n{job['technician_notes']}\")\nif job.get('job_updates'):\n    updates_str = '\\n'.join(f'- {u}' for u in job['job_updates'])\n    parts.append(f\"JOB UPDATES (milestones):\\n{updates_str}\")\n\nraw_text = '\\n\\n'.join(parts) or 'No notes provided.'\n\nsystem_prompt = \"\"\"You are a field service data processor. Extract structured information from technician notes and job updates.\nRespond ONLY with valid JSON — no explanation, no markdown fences, no preamble.\n\nOutput schema:\n{\n  \"cleaned_notes\": \"grammar-corrected, de-duplicated summary of what was done\",\n  \"issues_found\": [\"specific problems identified\"],\n  \"work_performed\": [\"tasks completed — derive from job updates and notes\"],\n  \"parts_replaced\": [\"parts installed or replaced — empty list if none mentioned\"],\n  \"urgent_flags\": [\"anything urgent or safety-related — empty list if none\"],\n  \"follow_up_required\": true,\n  \"follow_up_reason\": \"string or null\"\n}\"\"\"\n\npayload = json.dumps({\n    'model': 'claude-haiku-4-5-20251001',\n    'max_tokens': 600,\n    'system': system_prompt,\n    'messages': [{'role': 'user', 'content': raw_text}]\n}).encode('utf-8')\n\nreq = urllib.request.Request(\n    'https://api.anthropic.com/v1/messages',\n    data=payload,\n    headers={\n        'x-api-key': _env.get('ANTHROPIC_API_KEY', ''),\n        'anthropic-version': '2023-06-01',\n        'content-type': 'application/json'\n    },\n    method='POST'\n)\n\ntry:\n    with urllib.request.urlopen(req) as resp:\n        response_data = json.loads(resp.read().decode('utf-8'))\n    ai_result = json.loads(response_data['content'][0]['text'].strip())\nexcept Exception:\n    # Graceful fallback — never block the pipeline on AI failure\n    ai_result = {\n        'cleaned_notes':      job.get('technician_notes', 'Notes could not be parsed.'),\n        'issues_found':       [],\n        'work_performed':     job.get('job_updates', []),\n        'parts_replaced':     [],\n        'urgent_flags':       ['AI parsing failed — manual review required'],\n        'follow_up_required': False,\n        'follow_up_reason':   None\n    }\n\nreturn [{'json': {**job, 'ai': ai_result}}]\n"
+      },
+      "id": "light-ai",
+      "name": "🤖 STEP 2: Light AI — Clean & Extract (Haiku)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "notes": "Claude Haiku — cheapest model, runs on every job. Cleans Notes + Description + Job Updates into structured JSON."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# ── STEP 3: BUSINESS LOGIC (NO AI) ──────────────────────────────────────────\n# Rules engine: compliance checks, missing data detection, upsell triggers.\n# Zero AI cost — pure Python.\n\nimport re\n\njob  = _input.first().json\nai   = job.get('ai', {})\n\nissues   = []  # dicts: type / message / severity\nwarnings = []  # plain strings\nupsells  = []  # plain strings\n\n# ── COMPLIANCE CHECKS ────────────────────────────────────────────────────────\n\n# 1. Customer email required for delivery (column: Customer email)\nemail = job.get('customer_email', '')\nif not email or '@' not in email:\n    issues.append({\n        'type': 'MISSING_EMAIL',\n        'message': 'Customer email is missing — report cannot be delivered',\n        'severity': 'CRITICAL'\n    })\n\n# 2. Service address must be present\nif not job.get('service_address', '').strip():\n    issues.append({\n        'type': 'MISSING_ADDRESS',\n        'message': 'Service address not recorded',\n        'severity': 'WARNING'\n    })\n\n# 3. Technician notes minimum length (column: Notes)\nnotes = job.get('technician_notes', '')\nif len(notes.strip()) < 20:\n    issues.append({\n        'type': 'INSUFFICIENT_NOTES',\n        'message': 'Technician notes are too brief (under 20 characters)',\n        'severity': 'WARNING'\n    })\n\n# 4. Assigned technician must be set\nif not job.get('assigned_technician', '').strip() or job.get('assigned_technician') == 'Unknown':\n    issues.append({\n        'type': 'NO_TECHNICIAN',\n        'message': 'No technician assigned to this job',\n        'severity': 'WARNING'\n    })\n\n# 5. Duration sanity check (only if both timestamps present)\nduration = job.get('duration_mins')\nif duration is not None:\n    if duration < 5:\n        warnings.append('Job duration under 5 minutes — possible timestamp error')\n    elif duration > 480:\n        warnings.append('Job duration over 8 hours — please verify timestamps')\n\n# 6. High-priority jobs should have no unreviewed urgent flags\nif job.get('priority') == 'High' and not ai.get('urgent_flags'):\n    warnings.append('High-priority job — verify all safety checks were completed')\n\n# 7. Urgent flags raised by AI\nfor flag in ai.get('urgent_flags', []):\n    if 'manual review' not in flag.lower():\n        issues.append({\n            'type': 'URGENT_AI_FLAG',\n            'message': f'Urgent item flagged: {flag}',\n            'severity': 'URGENT'\n        })\n\n# 8. Follow-up marked required but no reason given\nif ai.get('follow_up_required') and not ai.get('follow_up_reason'):\n    warnings.append('Follow-up is required but no reason was documented')\n\n# ── UPSELL TRIGGERS ───────────────────────────────────────────────────────────\n# Scan description + cleaned notes + issues\nsearch_text = ' '.join([\n    job.get('description', ''),\n    ai.get('cleaned_notes', ''),\n    ' '.join(ai.get('issues_found', []))\n]).lower()\n\nupsell_rules = [\n    (r'old|aged|worn|deteriorat|corrode|rust',\n     'Unit showing age — consider a preventive maintenance package'),\n    (r'filter|dirty|clogged|blocked',\n     'Filter replacement or cleaning service recommended'),\n    (r'leak|drip|moisture|water damage',\n     'Plumbing inspection recommended following reported leak'),\n    (r'noise|rattle|vibrat|bang',\n     'Vibration dampening or mechanical inspection recommended'),\n    (r'hvac|air.?con|cooling|heating|refriger',\n     'Annual HVAC service contract available — priority scheduling included'),\n]\n\nfor pattern, suggestion in upsell_rules:\n    if re.search(pattern, search_text):\n        upsells.append(suggestion)\n\nif duration and duration > 180:\n    upsells.append('Extended job — consider a service contract for priority response times')\n\n# ── GATE DECISION ─────────────────────────────────────────────────────────────\nhas_critical    = any(i['severity'] == 'CRITICAL' for i in issues)\ncan_send_report = not has_critical\n\nreturn [{\n    'json': {\n        **job,\n        'compliance': {\n            'issues':          issues,\n            'warnings':        warnings,\n            'upsells':         upsells,\n            'has_critical':    has_critical,\n            'can_send_report': can_send_report\n        }\n    }\n}]\n"
+      },
+      "id": "business-logic",
+      "name": "⚙️ STEP 3: Business Logic — Compliance & Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1200, 300],
+      "notes": "NO AI — pure Python rules engine. Checks compliance, detects missing data, keyword-triggers upsells."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [{
+            "id": "can-send-check",
+            "leftValue": "={{$json.compliance.can_send_report}}",
+            "rightValue": true,
+            "operator": { "type": "boolean", "operation": "equals" }
+          }],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "gate-check",
+      "name": "🚦 Can Send Report?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "notes": "TRUE → generate AI report and PDF. FALSE → log blocked job."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# ── STEP 4: PREMIUM AI — Claude Sonnet ───────────────────────────────────────\n# Runs ONLY when the compliance gate clears.\n# Generates customer-friendly narrative + internal technical report.\n#\n# Passes real column values into the prompt:\n#   job_title, job_number, priority, customer_name, service_address,\n#   assigned_technician, scheduled_date, description, job_updates\n\nimport json\nimport urllib.request\n\njob  = _input.first().json\nai   = job.get('ai', {})\ncomp = job.get('compliance', {})\n\nsystem_prompt = \"\"\"You are a professional field service report writer for a trades and maintenance company.\nGenerate two outputs from the structured technician data provided.\nRespond ONLY with valid JSON — no markdown fences, no explanation.\n\nOutput schema:\n{\n  \"customer_summary\": {\n    \"headline\": \"One sentence summarising the visit outcome\",\n    \"what_we_did\": \"2-3 paragraph customer-friendly explanation — no jargon\",\n    \"what_we_found\": \"Plain-English description of findings\",\n    \"recommendations\": [\"1-3 actionable recommendations for the customer\"],\n    \"next_steps\": \"What happens next\"\n  },\n  \"internal_report\": {\n    \"technical_summary\": \"Detailed technical narrative for internal records\",\n    \"root_cause_analysis\": \"What caused the issue, or N/A\",\n    \"compliance_notes\": \"Any compliance or safety observations\",\n    \"billing_notes\": \"Notes relevant to invoicing\"\n  }\n}\"\"\"\n\nduration = job.get('duration_mins')\nif duration:\n    h, m = divmod(duration, 60)\n    dur_str = f\"{h}h {m}m\" if h else f\"{m}m\"\nelse:\n    dur_str = 'Not recorded'\n\nupdates_str = '\\n'.join(f'  - {u}' for u in job.get('job_updates', [])) or '  None recorded'\n\nuser_prompt = f\"\"\"JOB TITLE: {job.get('job_title', 'General Service')}\nJOB NUMBER: {job.get('job_number', 'N/A')}\nPRIORITY: {job.get('priority', 'Normal')}\nCUSTOMER: {job.get('customer_name', 'Unknown')}\nSERVICE ADDRESS: {job.get('service_address', 'Not recorded')}\nTECHNICIAN: {job.get('assigned_technician', 'Unknown')}\nSCHEDULED DATE: {job.get('scheduled_date', 'Not recorded')}\nDURATION: {dur_str}\n\nCUSTOMER-REPORTED ISSUE:\n{job.get('description', 'Not provided')}\n\nCLEANED TECHNICIAN NOTES:\n{ai.get('cleaned_notes', 'None')}\n\nJOB UPDATES COMPLETED:\n{updates_str}\n\nISSUES FOUND: {'; '.join(ai.get('issues_found', [])) or 'None reported'}\nWORK PERFORMED: {'; '.join(ai.get('work_performed', [])) or 'General service'}\nPARTS REPLACED: {', '.join(ai.get('parts_replaced', [])) or 'None'}\nFOLLOW-UP REQUIRED: {'Yes — ' + (ai.get('follow_up_reason') or 'unspecified') if ai.get('follow_up_required') else 'No'}\nURGENT FLAGS: {'; '.join(ai.get('urgent_flags', [])) or 'None'}\nUPSELL OPPORTUNITIES: {'; '.join(comp.get('upsells', [])) or 'None'}\n\"\"\"\n\npayload = json.dumps({\n    'model': 'claude-sonnet-4-20250514',\n    'max_tokens': 1200,\n    'system': system_prompt,\n    'messages': [{'role': 'user', 'content': user_prompt}]\n}).encode('utf-8')\n\nreq = urllib.request.Request(\n    'https://api.anthropic.com/v1/messages',\n    data=payload,\n    headers={\n        'x-api-key': _env.get('ANTHROPIC_API_KEY', ''),\n        'anthropic-version': '2023-06-01',\n        'content-type': 'application/json'\n    },\n    method='POST'\n)\n\ntry:\n    with urllib.request.urlopen(req) as resp:\n        response_data = json.loads(resp.read().decode('utf-8'))\n    report_content = json.loads(response_data['content'][0]['text'].strip())\nexcept Exception:\n    # Fallback — populate from structured AI data so the PDF can still render\n    report_content = {\n        'customer_summary': {\n            'headline':        f\"Service completed for {job.get('customer_name', 'your property')}\",\n            'what_we_did':     ai.get('cleaned_notes', 'Service was completed as requested.'),\n            'what_we_found':   ', '.join(ai.get('issues_found', [])) or 'No major issues found.',\n            'recommendations': comp.get('upsells', []),\n            'next_steps':      ai.get('follow_up_reason') if ai.get('follow_up_required') else 'No follow-up required.'\n        },\n        'internal_report': {\n            'technical_summary':   ai.get('cleaned_notes', 'See technician notes.'),\n            'root_cause_analysis': 'N/A',\n            'compliance_notes':    '; '.join(comp.get('warnings', [])) or 'None',\n            'billing_notes':       f\"Duration: {dur_str}. Parts: {', '.join(ai.get('parts_replaced', [])) or 'none'}.\"\n        }\n    }\n\nreturn [{'json': {**job, 'report_content': report_content}}]\n"
+      },
+      "id": "premium-ai",
+      "name": "✨ STEP 4: Premium AI — Generate Report (Sonnet)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 200],
+      "notes": "Claude Sonnet — only runs on jobs that cleared compliance. Writes customer narrative + internal report."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# ── PDF HTML BUILDER ──────────────────────────────────────────────────────────\n# Generates a complete A4-ready HTML report from all upstream data.\n# Real column values used throughout.\n\nfrom datetime import datetime, timezone\n\njob  = _input.first().json\nai   = job.get('ai', {})\nrc   = job.get('report_content', {})\ncs   = rc.get('customer_summary', {})\nir   = rc.get('internal_report', {})\ncomp = job.get('compliance', {})\n\n# ── Helpers ───────────────────────────────────────────────────────────────────\ndef fmt_date(iso_str):\n    if not iso_str:\n        return 'Not recorded'\n    try:\n        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))\n        return dt.strftime('%-d %B %Y at %I:%M %p')\n    except (ValueError, AttributeError):\n        return iso_str\n\nduration = job.get('duration_mins')\nif duration:\n    h, m = divmod(duration, 60)\n    dur_str = f\"{h}h {m}m\" if h else f\"{m}m\"\nelse:\n    dur_str = 'N/A'\n\npriority = job.get('priority', 'Normal')\npriority_colour = {'High': '#DC2626', 'Medium': '#D97706', 'Low': '#16A34A'}.get(priority, '#374151')\n\n# ── Sub-components ────────────────────────────────────────────────────────────\n\n# Urgent banner\nurgent_flags = [f for f in ai.get('urgent_flags', []) if 'manual review' not in f.lower()]\nurgent_banner = ''\nif urgent_flags:\n    flags_html = '<br>'.join(urgent_flags)\n    urgent_banner = f\"\"\"\n    <div style=\"background:#FEF2F2;border-left:4px solid #DC2626;padding:12px 16px;margin:20px 0;border-radius:4px;\">\n      <strong style=\"color:#DC2626;\">&#9888; Action Required</strong>\n      <p style=\"margin:6px 0 0;color:#7F1D1D;font-size:13px;\">{flags_html}</p>\n    </div>\"\"\"\n\n# Job updates timeline (from Job Updates column)\nupdates = job.get('job_updates', [])\nif updates:\n    steps = ''.join(\n        f'<li style=\"margin-bottom:6px;color:#374151;\">&#10003; {u}</li>'\n        for u in updates\n    )\n    updates_html = f'<ul style=\"padding-left:18px;margin:8px 0 0;\">{steps}</ul>'\nelse:\n    updates_html = '<p style=\"color:#9CA3AF;font-size:13px;\">No update milestones recorded</p>'\n\n# Parts tags\nparts = ai.get('parts_replaced', [])\nparts_html = ''.join(\n    f'<span style=\"display:inline-block;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:500;background:#FEF9C3;color:#854D0E;margin:2px;\">{p}</span>'\n    for p in parts\n) if parts else '<span style=\"color:#9CA3AF;font-size:13px;\">None</span>'\n\n# Recommendations\nrecs = cs.get('recommendations') or comp.get('upsells', [])\nrecs_html = '<ul style=\"padding-left:18px;margin:6px 0 0;\">' + \\\n    ''.join(f'<li style=\"margin-bottom:4px;color:#374151;\">{r}</li>' for r in recs) + \\\n    '</ul>' if recs else '<p style=\"color:#9CA3AF;font-size:13px;\">No specific recommendations at this time</p>'\n\n# Upsell box\nupsells = comp.get('upsells', [])\nupsell_html = ''\nif upsells:\n    items = ''.join(f'<li style=\"margin-bottom:4px;\">{u}</li>' for u in upsells)\n    upsell_html = f\"\"\"\n    <div style=\"background:#F0FDF4;border-left:4px solid #16A34A;padding:12px 16px;border-radius:4px;margin-top:16px;\">\n      <strong style=\"color:#15803D;\">&#128161; Service Opportunities</strong>\n      <ul style=\"margin:8px 0 0;padding-left:18px;color:#166534;font-size:13px;\">{items}</ul>\n    </div>\"\"\"\n\n# Compliance warnings (internal)\nwarnings_text = '<br>'.join(comp.get('warnings', [])) or 'None'\n\n# Generated timestamp\ngenerated = datetime.now(timezone.utc).strftime('%-d %B %Y at %H:%M UTC')\n\n# ── Full HTML ─────────────────────────────────────────────────────────────────\nhtml = f\"\"\"<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"UTF-8\">\n<style>\n  * {{ box-sizing: border-box; margin: 0; padding: 0; }}\n  body {{ font-family: 'Segoe UI', Arial, sans-serif; font-size: 14px; color: #111827; background: #fff; }}\n  .page {{ max-width: 800px; margin: 0 auto; padding: 40px; }}\n  .header {{ display: flex; justify-content: space-between; align-items: flex-start; padding-bottom: 20px; border-bottom: 2px solid #1D4ED8; margin-bottom: 24px; }}\n  .co-name {{ font-size: 22px; font-weight: 700; color: #1D4ED8; }}\n  .report-sub {{ font-size: 12px; color: #6B7280; margin-top: 3px; }}\n  .meta-grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; background: #F9FAFB; border-radius: 8px; padding: 16px; margin-bottom: 24px; }}\n  .meta-item label {{ font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: #6B7280; }}\n  .meta-item span  {{ display: block; font-weight: 600; color: #111827; margin-top: 2px; font-size: 13px; }}\n  h2 {{ font-size: 15px; font-weight: 600; color: #1D4ED8; margin: 24px 0 10px; padding-bottom: 5px; border-bottom: 1px solid #DBEAFE; }}\n  h3 {{ font-size: 13px; font-weight: 600; color: #374151; margin: 14px 0 5px; }}\n  p  {{ line-height: 1.65; color: #374151; }}\n  .section-box {{ background: #F9FAFB; border-radius: 8px; padding: 14px; margin-top: 6px; }}\n  .divider {{ height: 1px; background: #E5E7EB; margin: 28px 0; }}\n  .footer {{ margin-top: 36px; padding-top: 14px; border-top: 1px solid #E5E7EB; font-size: 11px; color: #9CA3AF; display: flex; justify-content: space-between; }}\n  .internal-tag {{ display: inline-block; background: #FEF3C7; color: #92400E; font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.05em; margin-left: 8px; }}\n  .priority-badge {{ display: inline-block; padding: 2px 9px; border-radius: 12px; font-size: 11px; font-weight: 600; color: {priority_colour}; border: 1px solid {priority_colour}; }}\n  @media print {{ body {{ -webkit-print-color-adjust: exact; }} .page {{ padding: 24px; }} }}\n</style>\n</head>\n<body>\n<div class=\"page\">\n\n  <div class=\"header\">\n    <div>\n      <div class=\"co-name\">Service Report</div>\n      <div class=\"report-sub\">Job #{job.get('job_number', 'N/A')} &nbsp;&#183;&nbsp; {job.get('job_title', 'General Service')}</div>\n    </div>\n    <div style=\"text-align:right;\">\n      <div class=\"priority-badge\">{priority} Priority</div>\n      <div style=\"font-size:12px;color:#6B7280;margin-top:6px;\">Scheduled: {job.get('scheduled_date', 'Not scheduled')}</div>\n    </div>\n  </div>\n\n  <div class=\"meta-grid\">\n    <div class=\"meta-item\"><label>Customer</label><span>{job.get('customer_name', 'N/A')}</span></div>\n    <div class=\"meta-item\"><label>Service Address</label><span>{job.get('service_address', 'N/A')}</span></div>\n    <div class=\"meta-item\"><label>Technician</label><span>{job.get('assigned_technician', 'N/A')}</span></div>\n    <div class=\"meta-item\"><label>Submitted</label><span>{fmt_date(job.get('submitted_at'))}</span></div>\n    <div class=\"meta-item\"><label>Completed</label><span>{fmt_date(job.get('completed_at'))}</span></div>\n    <div class=\"meta-item\"><label>Duration</label><span>{dur_str}</span></div>\n  </div>\n\n  {urgent_banner}\n\n  <h2>Summary of Work</h2>\n  <p style=\"font-size:15px;font-weight:500;color:#1D4ED8;margin-bottom:12px;\">{cs.get('headline', '')}</p>\n  <div class=\"section-box\">\n    <p>{cs.get('what_we_did', '').replace(chr(10), '</p><p style=\"margin-top:10px;\">')}</p>\n  </div>\n\n  <h3>What We Found</h3>\n  <p>{cs.get('what_we_found', ', '.join(ai.get('issues_found', [])) or 'No issues found during this visit.')}</p>\n\n  <h3>Parts &amp; Materials Used</h3>\n  <div style=\"margin-top:6px;\">{parts_html}</div>\n\n  <h2>Work Completed</h2>\n  {updates_html}\n\n  <h2>Our Recommendations</h2>\n  {recs_html}\n  {upsell_html}\n\n  <h3>Next Steps</h3>\n  <p>{cs.get('next_steps', 'No follow-up required at this time.')}</p>\n\n  <div class=\"divider\"></div>\n\n  <h2>Internal Report <span class=\"internal-tag\">INTERNAL USE ONLY</span></h2>\n\n  <h3>Technical Summary</h3>\n  <div class=\"section-box\"><p>{ir.get('technical_summary', ai.get('cleaned_notes', 'No technical notes.'))}</p></div>\n\n  <h3>Root Cause Analysis</h3>\n  <p>{ir.get('root_cause_analysis', 'N/A')}</p>\n\n  <h3>Compliance &amp; Safety Notes</h3>\n  <p>{ir.get('compliance_notes', warnings_text)}</p>\n\n  <h3>Billing Notes</h3>\n  <p>{ir.get('billing_notes', f'Duration: {dur_str}. Parts: none.')}</p>\n\n  <div class=\"footer\">\n    <span>Generated {generated}</span>\n    <span>Job #{job.get('job_number', 'N/A')} &nbsp;&#183;&nbsp; {job.get('customer_name', '')}</span>\n  </div>\n\n</div>\n</body>\n</html>\"\"\"\n\nreturn [{'json': {**job, 'pdf_html': html}}]\n"
+      },
+      "id": "build-pdf-html",
+      "name": "📄 Build PDF HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1960, 200],
+      "notes": "Pure Python f-string template. Builds full A4 HTML from real column names. Job Updates rendered as a checklist timeline."
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "html": "={{$json.pdf_html}}",
+        "options": {
+          "format": "A4",
+          "margin": { "top": "15mm", "right": "15mm", "bottom": "15mm", "left": "15mm" }
+        },
+        "binaryPropertyName": "report_pdf",
+        "fileName": "=Service_Report_{{$json.job_number}}_{{$json.customer_name.replace(/ /g,'_')}}.pdf"
+      },
+      "id": "html-to-pdf",
+      "name": "🖨 Convert HTML → PDF",
+      "type": "n8n-nodes-base.htmlToPdf",
+      "typeVersion": 1,
+      "position": [2200, 200],
+      "notes": "Requires n8n-nodes-html-pdf community node. Alternatively swap for a Gotenberg HTTP call (one Docker image)."
+    },
+    {
+      "parameters": {
+        "fromEmail": "reports@yourcompany.com.au",
+        "toEmail": "={{$json.customer_email}}",
+        "subject": "=Your Service Report — {{$json.job_title}} | {{$json.job_number}}",
+        "emailType": "html",
+        "html": "=<p>Dear {{$json.customer_name}},</p>\n<p>Thank you for choosing us. Please find your service report attached for the <strong>{{$json.job_title}}</strong> completed at {{$json.service_address}}.</p>\n<p><strong>{{$json.report_content.customer_summary.headline}}</strong></p>\n<p>{{$json.report_content.customer_summary.next_steps}}</p>\n<p>If you have any questions, please don't hesitate to get in touch.</p>\n<p>Kind regards,<br><strong>The Service Team</strong></p>",
+        "attachments": "report_pdf",
+        "options": { "ccEmail": "ops@yourcompany.com.au" }
+      },
+      "id": "send-email",
+      "name": "📧 Email Report to Client",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2440, 200],
+      "notes": "Sends PDF to Customer email from the Jobs table. CC's internal ops. Configure SMTP credentials in n8n."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.airtable.com/v0/{{$vars.AIRTABLE_BASE_ID}}/Jobs/{{$json.record_id}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer {{$vars.AIRTABLE_API_KEY}}" },
+            { "name": "Content-Type",  "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"fields\": {\"Status\": \"Completed\", \"Notes\": \"{{$json.ai.cleaned_notes}}\"}}"
+      },
+      "id": "update-airtable",
+      "name": "✅ Mark as Sent in Airtable",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2680, 200],
+      "notes": "Updates Status to Completed and writes cleaned notes back. Prevents reprocessing on next poll."
+    },
+    {
+      "parameters": {
+        "language": "python",
+        "pythonCode": "# ── ERROR LOG: Jobs that failed compliance checks ─────────────────────────────\n# Logs to n8n console. Uncomment Slack block to alert ops team.\n\njob    = _input.first().json\nissues = job.get('compliance', {}).get('issues', [])\n\nlines = [f\"[JOB BLOCKED] {job.get('job_number', 'unknown')} — {job.get('customer_name', 'unknown')}\"]\nfor i in issues:\n    lines.append(f\"  {i.get('severity', 'INFO')}: {i.get('message', '')}\")\n\nprint('\\n'.join(lines))\n\n# Optional Slack alert — set SLACK_WEBHOOK_URL in n8n Variables\n# import urllib.request, json as _json\n# webhook = _env.get('SLACK_WEBHOOK_URL', '')\n# if webhook:\n#     payload = _json.dumps({'text': '\\n'.join(lines)}).encode()\n#     urllib.request.urlopen(urllib.request.Request(\n#         webhook, data=payload,\n#         headers={'Content-Type': 'application/json'}, method='POST'\n#     ))\n\nreturn [{\n    'json': {\n        'job_number': job.get('job_number', 'unknown'),\n        'customer':   job.get('customer_name', 'unknown'),\n        'blocked':    True,\n        'reason':     ' | '.join(f\"[{i.get('severity')}] {i.get('message')}\" for i in issues)\n    }\n}]\n"
+      },
+      "id": "error-log",
+      "name": "🔴 Log Blocked Job",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1700, 440],
+      "notes": "Jobs failing CRITICAL checks land here. Logs to n8n console. Uncomment Slack block to alert ops."
+    },
+    {
+      "parameters": { "amount": 2, "unit": "seconds" },
+      "id": "rate-limit",
+      "name": "⏳ Rate Limit Pause",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [2920, 200],
+      "notes": "2s pause between jobs to avoid Anthropic API and SMTP rate limits when batch processing."
+    }
+  ],
+  "connections": {
+    "⏱ Poll Every 15 Min": {
+      "main": [[{ "node": "📋 Fetch Jobs (Airtable / Softr)", "type": "main", "index": 0 }]]
+    },
+    "📋 Fetch Jobs (Airtable / Softr)": {
+      "main": [[{ "node": "🗂 STEP 1: Structure & Map Fields", "type": "main", "index": 0 }]]
+    },
+    "🗂 STEP 1: Structure & Map Fields": {
+      "main": [[{ "node": "🤖 STEP 2: Light AI — Clean & Extract (Haiku)", "type": "main", "index": 0 }]]
+    },
+    "🤖 STEP 2: Light AI — Clean & Extract (Haiku)": {
+      "main": [[{ "node": "⚙️ STEP 3: Business Logic — Compliance & Rules", "type": "main", "index": 0 }]]
+    },
+    "⚙️ STEP 3: Business Logic — Compliance & Rules": {
+      "main": [[{ "node": "🚦 Can Send Report?", "type": "main", "index": 0 }]]
+    },
+    "🚦 Can Send Report?": {
+      "main": [
+        [{ "node": "✨ STEP 4: Premium AI — Generate Report (Sonnet)", "type": "main", "index": 0 }],
+        [{ "node": "🔴 Log Blocked Job", "type": "main", "index": 0 }]
+      ]
+    },
+    "✨ STEP 4: Premium AI — Generate Report (Sonnet)": {
+      "main": [[{ "node": "📄 Build PDF HTML", "type": "main", "index": 0 }]]
+    },
+    "📄 Build PDF HTML": {
+      "main": [[{ "node": "🖨 Convert HTML → PDF", "type": "main", "index": 0 }]]
+    },
+    "🖨 Convert HTML → PDF": {
+      "main": [[{ "node": "📧 Email Report to Client", "type": "main", "index": 0 }]]
+    },
+    "📧 Email Report to Client": {
+      "main": [[{ "node": "✅ Mark as Sent in Airtable", "type": "main", "index": 0 }]]
+    },
+    "✅ Mark as Sent in Airtable": {
+      "main": [[{ "node": "⏳ Rate Limit Pause", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "staticData": null,
+  "meta": { "templateId": "softr-job-report-automation-python-v2", "instanceId": "local" },
+  "pinData": {},
+  "versionId": "2.0.0",
+  "_readme": {
+    "jobs_table_columns": [
+      "Job Title", "Job Number", "Status", "Scheduled Date", "Priority",
+      "Customer Name", "Service Address", "Description", "Notes",
+      "Submitted At", "Completed At", "Assigned Technician", "Job Updates", "Customer email"
+    ],
+    "column_notes": {
+      "Job Updates": "Semicolon-delimited milestone string — split into list in Step 1",
+      "Notes":       "Raw technician notes — cleaned by Haiku in Step 2",
+      "Status":      "Poll targets 'Submitted'. Patched to 'Completed' after report sent.",
+      "Customer email": "Lowercase 'e' — match exactly as it appears in Airtable"
+    },
+    "required_n8n_variables": [
+      "AIRTABLE_API_KEY — personal access token",
+      "AIRTABLE_BASE_ID — appXXXXXXXX from your Airtable URL",
+      "ANTHROPIC_API_KEY — your Anthropic key"
+    ],
+    "optional_n8n_variables": [
+      "SLACK_WEBHOOK_URL — uncomment Slack block in error log node"
+    ],
+    "cost_per_job": {
+      "haiku_step2":  "~$0.002",
+      "sonnet_step4": "~$0.04 (only for jobs that pass compliance)",
+      "total":        "~$0.04-0.05 per complete report"
+    }
+  }
+}

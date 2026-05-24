@@ -1,0 +1,19 @@
+FROM alpine:latest AS alpine
+
+FROM n8nio/runners:2.20.9
+
+USER root
+
+# 2. Copy apk tools into the runner
+COPY --from=alpine /sbin/apk /sbin/apk
+COPY --from=alpine /usr/lib/libapk.so* /usr/lib/
+
+RUN apk update && apk add --no-cache \
+    libreoffice \
+    font-liberation \
+    fontconfig
+
+RUN cd /opt/runners/task-runner-python && \
+    uv pip install python-docx docx2pdf lxml docxtpl
+
+USER runner

@@ -1,0 +1,20 @@
+{
+  "task-runners": [
+    {
+      "runner-type": "javascript",
+      "workdir": "/home/runner",
+      "health-check-server-port": "5681"
+    },
+    {
+      "runner-type": "python",
+      "workdir": "/home/runner",
+      "command": "/opt/runners/task-runner-python/.venv/bin/python",
+      "args": ["-I", "-B", "-X", "disable_remote_debug", "-m", "src.main"],
+      "health-check-server-port": "5682",
+      "env-overrides": {
+        "N8N_RUNNERS_STDLIB_ALLOW": "*",
+        "N8N_RUNNERS_EXTERNAL_ALLOW": "lxml,docx,docx2pdf,docxtpl"
+      }
+    }
+  ]
+}
