@@ -1,0 +1,266 @@
+{
+  "name": "Gmail > Extract Job > ServiceM8 copy",
+  "nodes": [
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "4da020ce-10f5-4b00-b2f4-0d7575dc9fd3",
+              "leftValue": "={{ $json.text }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "779a7c99-8dbb-46c7-971f-7d2b9df11591",
+              "leftValue": "={{ $json.from.value[0].address }}",
+              "rightValue": "sandeep.dudhraj@outlook.com",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        -304,
+        -16
+      ],
+      "id": "4ea313c2-4711-4693-b6e5-ab07723015d7",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "resource": "job",
+        "operation": "create",
+        "fields": {
+          "field": [
+            {
+              "field": "job_description",
+              "value": "={{ $json.job_description }}"
+            },
+            {
+              "field": "job_address",
+              "value": "={{ $json.job_address }}"
+            },
+            {
+              "field": "queue_expiry_date",
+              "value": "={{ $json.scheduled_date }}"
+            }
+          ]
+        }
+      },
+      "type": "@servicem8/n8n-nodes-servicem8.serviceM8",
+      "typeVersion": 1,
+      "position": [
+        592,
+        -16
+      ],
+      "id": "fa1aa26d-a6d3-4e9f-9de7-1dcb36602baa",
+      "name": "Create a job",
+      "credentials": {
+        "serviceM8CredentialsApi": {
+          "id": "lKeIibVLr9P14R9I",
+          "name": "ServiceM8 Credentials account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{ $json.choices[0].message.content }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        368,
+        -16
+      ],
+      "id": "bd8350cd-62b1-4874-bacf-ae6cd236611f",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://router.huggingface.co/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBearerAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  model: \"Qwen/Qwen2.5-14B-Instruct:featherless-ai\",\n  messages: [\n    {\n      role: \"user\",\n      content: `\nYou are an Trade Service expert.\n\nYour task is to transform input information into ServiceM8 API job json.\n\nThe input data comes from customers needing their work done and may contain:\n- HVAC, plumbing, electrician vocabs\n- australian specific words\n- date time for the job\n- address where job needs to be done\n- name of the client\n- parts needed for the job.\n\nYou must interpret,  structure and create json.\n\n--------------------\nINPUT\n--------------------\n\nClient Email Subject: ${$json[\"subject\"]}\nClient Email From: ${$json.from.value[0].name} \nClient Email Body: ${$json[\"text\"]} \nEmail Received date: ${$json.date}\n--------------------\nTASKS\n--------------------\n\n\n1. Interpret\n\nCreate a polished customer-friendly service report.\n\nRequirements:\n- Understand what the work is.\n- Understand date, time, place for the work.\n- Understand client's name.\n- Understand parts that might be needed for the job.\n\n\nInterpret relative dates based on CURRENT DATE.\n\nExamples:\n- tomorrow\n- next Monday\n- before Friday\n- this week\n\nIf an exact date cannot be determined with confidence,\nreturn null.\n\n2. ServiceM8 API specs\n\nAnalyze whether critical information is missing.\n\nExamples:\n- when is the job scheduled for (format: YYYY/MM/DD).\n- address for job (exact address)\n- description for job.\n\n3. Date Rules:\n\n- If exact date is specified, convert to YYYY-MM-DD.\n- If relative date can be resolved using CURRENT DATE, convert it.\n- If date is ambiguous, return null.\n- Never invent dates.\n- Never invent years.\n\n--------------------\nOUTPUT FORMAT\n--------------------\n\nReturn ONLY valid JSON.\n\nUse this exact schema:\n\n{\n  \"scheduled_date\": null,\n  \"date_confidence\": \"missing\",\n  \"requested_time_text\": \"sometime this week, preferably before Friday\",\n  \"job_address\": \"...\",\n  \"job_description\": \"...\"\n}\n\nDo not include markdown.\nDo not include explanations.\nDo not include code fences.\nReturn valid parsable JSON only.\n`\n    }\n  ],\n  temperature: 0.3,\n  max_tokens: 1200\n}\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        144,
+        -16
+      ],
+      "id": "fa006d9f-ff81-42b0-b8a4-25cda0012824",
+      "name": "HF AI API",
+      "alwaysOutputData": false,
+      "credentials": {
+        "httpBearerAuth": {
+          "id": "xdBDZ4tSLXD0A4iC",
+          "name": "Bearer Auth account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "simple": false,
+        "filters": {},
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        -528,
+        -16
+      ],
+      "id": "6337605f-903b-4293-9b13-f840faefae88",
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "Lir6umXkhr0KaGWl",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "5e07cab5-4825-466d-abb4-ef1547290da7",
+              "name": "text",
+              "value": "={{ $json.text }}",
+              "type": "string"
+            },
+            {
+              "id": "b1e608c3-eee3-47ea-854d-8c534c397cad",
+              "name": "subject",
+              "value": "={{ $json.subject }}",
+              "type": "string"
+            },
+            {
+              "id": "f9114521-c2eb-4361-8031-299bc9547491",
+              "name": "date",
+              "value": "={{ $json.date }}",
+              "type": "string"
+            },
+            {
+              "id": "ea374b72-229d-457e-8c3d-50b1f9f78618",
+              "name": "from.value[0].name",
+              "value": "={{ $json.from.value[0].name }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -80,
+        -16
+      ],
+      "id": "00592a72-bd87-40f6-876c-1c05b4e41c06",
+      "name": "Edit Fields1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Create a job",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HF AI API": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields1": {
+      "main": [
+        [
+          {
+            "node": "HF AI API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "4a5c58bd-e55b-4fb7-8042-835f04869088",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e8e446a94a65e6e502867a8d7d4ec71524aae50f10dd60f616fda5a10fcc8175" // pragma: allowlist secret
+  },
+  "id": "mbkqbgiU6S3q0rx1",
+  "tags": []
+}
